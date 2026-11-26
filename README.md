@@ -122,6 +122,49 @@ SHA-256 全部匹配的活动成员直接硬链接/复制复用，不发 GET；�
 恢复安装、target 消失、非法清单、截断成员、留存响应，以及两套完整 64 MiB 发布的
 `tracemalloc`/逻辑磁盘预算和关闭清理。
 
+## 进程内网关轮换与请求接入
+
+`GatewayFleet` 在同一进程内协调多个网关实例的逐个换版，但不实现新的 HTTP 代理或
+发布服务。每个运行槽持有一套独立的 `ReleaseReader` 上下文；请求句柄固定在接入时的
+整版上下文上，因此后续 `read(target)` 全部读本地文件，即使该成员已在新版删除也不会
+混入新配置或回源补齐：
+
+```python
+from gateway_fleet import FleetBusy, GatewayFleet, NoReadyWorker
+
+with GatewayFleet(
+    "127.0.0.1", port, "/release/manifest.json",
+    scratch_dir="/var/cache/gateway-fleet",
+    workers={
+        "backup": {"shared"},
+        "edge": {"shared", "critical"},
+    },
+    minimums={"shared": 1, "critical": 1},
+    slots=3,
+) as fleet:
+    version = fleet.roll("backup")       # 首次上架或逐个换版
+
+    with fleet.open_request("shared") as request:
+        request.worker                    # ASCII 升序选中的实例名
+        request.version                   # 接入时固定的版号
+        request.read("/members/example/<sha256>")
+```
+
+`open_request(group)` 只选择支持该组且正在接新请求的实例，并按实例名 ASCII 升序取
+首个；未知组或参数格式错误抛 `ValueError`，当前没有可接入实例抛 `NoReadyWorker`，
+全局打开句柄达到 64 个或没有合法换版槽安排时抛 `FleetBusy`。句柄和 Fleet 都支持
+上下文管理器及幂等 `close()`；仍有句柄时关闭 Fleet 会抛 `FleetBusy` 且不取消请求。
+
+槽位策略对调用方可观察：有空闲槽时，候选整版在新槽下载，旧上下文继续接流量；槽位
+已满时，只有当前槽没有打开句柄，并且原子下线该实例不会使任一流量组低于
+`min(configured_minimum, availability_at_roll_start)`，才在原槽内刷新。成功切换后，
+新请求只进入新版；旧上下文若仍被句柄使用则继续占槽，直到最后一个旧句柄关闭才清理。
+失败时候选槽立即释放，临时下线的旧版恢复接入。`occupied_slots` 返回实际占用槽数。
+
+`test_gateway_fleet.py` 用真实回环 HTTP 源、可控 GET 暂停/错误事件覆盖两槽原地换版、
+三槽候选换版、删除成员的旧句柄固定、槽满零 GET 拒绝、失败恢复、首次上架失败、64 个
+句柄上限和关闭清理。
+
 ## 进程内发布源站
 
 `ReleaseOrigin` 是上面的对侧：一个进程内、受配额约束的配置发布源站，直接与
