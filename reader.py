@@ -1,10 +1,15 @@
-"""Bounded client-side conditional GET and in-process scheduling."""
+"""Bounded client-side conditional GET and whole-release reading."""
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from http.client import HTTPConnection, HTTPException
+import hashlib
+import json
 import math
+import os
 from queue import Queue
 import re
+import shutil
+import tempfile
 import threading
 import time
 from urllib.parse import urlsplit
@@ -14,15 +19,33 @@ __all__ = [
     "ConditionalReader",
     "OriginError",
     "QueueFull",
+    "ReleaseReader",
+    "ReleaseUnavailable",
     "Representation",
     "RequestCancelled",
     "ScheduledReader",
     "Ticket",
 ]
 
+# Binary units and release-file bounds from the publishing contract.
+_KIB = 1024
+_MIB = 1024 * 1024
+_MANIFEST_LIMIT = 32 * _KIB
+_MEMBER_LIMIT = _MIB
+_TARGET_LIMIT = 256
+_MAX_MEMBERS = 64
+_VERSION_MAX = (1 << 63) - 1
+_IO_CHUNK = 64 * _KIB
+
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+
 
 class OriginError(RuntimeError):
     pass
+
+
+class ReleaseUnavailable(OriginError):
+    """No verified whole release is currently available for local reads."""
 
 
 class QueueFull(RuntimeError):
@@ -615,3 +638,416 @@ class ScheduledReader:
             return outcome
         finally:
             connection.close()
+
+
+def _validate_release_target(target):
+    """Validate the exact ASCII origin target and release length bound."""
+    _validate_target(target)
+    if len(target.encode("ascii")) > _TARGET_LIMIT:
+        raise ValueError(
+            f"target must be at most {_TARGET_LIMIT} UTF-8/ASCII bytes")
+
+
+def _reject_duplicate_json_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise OriginError(f"duplicate JSON object key: {key!r}")
+        result[key] = value
+    return result
+
+
+def _strict_manifest_int(value, field, lower, upper):
+    if type(value) is not int or not lower <= value <= upper:
+        raise OriginError(
+            f"{field} must be an integer in [{lower}, {upper}] (not bool)")
+    return value
+
+
+def _parse_release_manifest(raw, manifest_target):
+    try:
+        text = raw.decode("utf-8", errors="strict")
+        manifest_object = json.loads(
+            text, object_pairs_hook=_reject_duplicate_json_keys)
+    except OriginError:
+        raise
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise OriginError("release manifest is not valid UTF-8 JSON") from exc
+
+    if type(manifest_object) is not dict:
+        raise OriginError("release manifest must be a JSON object")
+    if set(manifest_object) != {"version", "serve_min", "members"}:
+        raise OriginError(
+            "release manifest fields must be exactly version, serve_min, members")
+
+    version = _strict_manifest_int(
+        manifest_object["version"], "version", 1, _VERSION_MAX)
+    serve_min = _strict_manifest_int(
+        manifest_object["serve_min"], "serve_min", 0, version)
+
+    raw_members = manifest_object["members"]
+    if type(raw_members) is not list or not 1 <= len(raw_members) <= _MAX_MEMBERS:
+        raise OriginError("members must be a list of 1..64 records")
+
+    members = {}
+    for index, record in enumerate(raw_members):
+        if type(record) is not dict:
+            raise OriginError(f"member {index} must be an object")
+        if set(record) != {"target", "size", "sha256"}:
+            raise OriginError(
+                f"member {index} fields must be exactly target, size, sha256")
+
+        target = record["target"]
+        try:
+            _validate_release_target(target)
+        except ValueError as exc:
+            raise OriginError(f"member {index} has an invalid target") from exc
+        if target == manifest_target:
+            raise OriginError("a member target cannot be the manifest target")
+        if target in members:
+            raise OriginError(f"duplicate member target: {target}")
+
+        size = _strict_manifest_int(
+            record["size"], f"member {index} size", 0, _MEMBER_LIMIT)
+        digest = record["sha256"]
+        if type(digest) is not str or _SHA256_RE.fullmatch(digest) is None:
+            raise OriginError(
+                f"member {index} sha256 must be 64 lowercase hex digits")
+
+        members[target] = _MemberSpec(target, size, digest)
+
+    return _Manifest(version, serve_min, members)
+
+
+def _accepted_get_length(response, max_length):
+    """Check the strict response framing/retention policy and return length."""
+    if response.headers.get_all("Transfer-Encoding"):
+        raise OriginError("responses with Transfer-Encoding are not accepted")
+
+    encodings = response.headers.get_all("Content-Encoding") or ()
+    for encoding in encodings:
+        codings = [part.strip().lower() for part in encoding.split(",")]
+        if any(coding != "identity" for coding in codings):
+            raise OriginError("only identity Content-Encoding is accepted")
+
+    for header in ("Vary", "Set-Cookie", "Cache-Control"):
+        if response.headers.get_all(header):
+            raise OriginError(f"responses with {header} are not installable")
+
+    lengths = response.headers.get_all("Content-Length")
+    if (len(lengths or ()) != 1
+            or _LENGTH_RE.fullmatch(lengths[0]) is None):
+        raise OriginError("200 must have exactly one bounded Content-Length")
+    length = int(lengths[0])
+    if length > max_length:
+        raise OriginError("200 Content-Length exceeds the declared bound")
+    return length
+
+
+@dataclass(frozen=True)
+class _MemberSpec:
+    target: str
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class _Manifest:
+    version: int
+    serve_min: int
+    members: dict
+
+
+@dataclass(frozen=True)
+class _StoredMember:
+    target: str
+    size: int
+    sha256: str
+    path: str
+
+
+class _ActiveRelease:
+    __slots__ = ("version", "directory", "members")
+
+    def __init__(self, version, directory, members):
+        self.version = version
+        self.directory = directory
+        self.members = members
+
+
+class ReleaseReader:
+    """Read and atomically install whole configuration releases from one origin."""
+
+    def __init__(self, host, port, manifest_target, *, scratch_dir, timeout=2):
+        # Validate caller-visible target arguments before creating workspace.
+        _validate_release_target(manifest_target)
+        self._host = host
+        self._port = port
+        self._manifest_target = manifest_target
+        self._timeout = timeout
+
+        # mkdtemp gives this instance a private subtree; close() removes only it.
+        scratch_path = os.path.abspath(os.fspath(scratch_dir))
+        self._root = tempfile.mkdtemp(
+            prefix="release-reader-", dir=scratch_path)
+        self._closed = False
+        self._baseline = None
+        self._active = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+        return False
+
+    @property
+    def active_version(self):
+        if self._closed or self._active is None:
+            return None
+        return self._active.version
+
+    def refresh(self):
+        if self._closed:
+            raise RuntimeError("ReleaseReader is closed")
+
+        manifest = self._fetch_and_parse_manifest()
+        self._advance_baseline(manifest)
+
+        active_at_start = self._active
+        if self._manifest_is_active(manifest):
+            return manifest.version
+
+        stage_dir = os.path.join(self._root, "stage")
+        must_retire = (
+            active_at_start is not None
+            and manifest.serve_min > active_at_start.version)
+        try:
+            self._remove_transient_paths()
+            os.mkdir(stage_dir)
+
+            if must_retire:
+                # Publishing the retirement decision in memory first makes
+                # the old release unreadable even if candidate population or
+                # a later member download fails.  The old directory stays
+                # available only long enough to hardlink/copy declared reuse.
+                self._active = None
+                try:
+                    reused = self._populate_reused(
+                        manifest, active_at_start, stage_dir)
+                finally:
+                    shutil.rmtree(
+                        active_at_start.directory, ignore_errors=True)
+            else:
+                reused = self._populate_reused(
+                    manifest, active_at_start, stage_dir)
+
+            self._download_missing_members(manifest, reused, stage_dir)
+            return self._commit_release(manifest, stage_dir)
+        except OriginError:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+            raise
+        except (OSError, HTTPException) as exc:
+            shutil.rmtree(stage_dir, ignore_errors=True)
+            raise OriginError("failed to install complete release") from exc
+
+    def read_active(self, target):
+        if self._closed:
+            raise RuntimeError("ReleaseReader is closed")
+
+        active = self._active
+        if active is None:
+            raise ReleaseUnavailable("no configuration release is active")
+        _validate_release_target(target)
+
+        member = active.members.get(target)
+        if member is None:
+            raise KeyError(target)
+
+        try:
+            # Member size is at most 1 MiB; this is the only whole-body
+            # allocation exposed by read_active().
+            with open(member.path, "rb") as handle:
+                return handle.read()
+        except OSError as exc:
+            raise ReleaseUnavailable("active release bytes are unavailable") from exc
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        self._active = None
+        self._baseline = None
+        shutil.rmtree(self._root, ignore_errors=True)
+
+    # ------------------------------------------------------------------
+    # Manifest and baseline
+    # ------------------------------------------------------------------
+
+    def _fetch_and_parse_manifest(self):
+        raw = self._http_get_manifest()
+        return _parse_release_manifest(raw, self._manifest_target)
+
+    def _http_get_manifest(self):
+        connection = HTTPConnection(
+            self._host, self._port, timeout=self._timeout)
+        try:
+            try:
+                connection.request(
+                    "GET", self._manifest_target,
+                    headers={"Connection": "close"})
+                with connection.getresponse() as response:
+                    if response.status != 200:
+                        raise OriginError(
+                            f"manifest origin returned HTTP {response.status}")
+                    length = _accepted_get_length(response, _MANIFEST_LIMIT)
+                    raw = response.read(length)
+                    if len(raw) != length:
+                        raise OriginError("manifest response ended early")
+            except OriginError:
+                raise
+            except (OSError, HTTPException) as exc:
+                raise OriginError("manifest GET failed") from exc
+        finally:
+            connection.close()
+        return raw
+
+    def _advance_baseline(self, manifest):
+        baseline = self._baseline
+        if baseline is not None:
+            if manifest.version < baseline.version:
+                raise OriginError("release version would move backwards")
+            if manifest.version == baseline.version:
+                if (manifest.serve_min != baseline.serve_min
+                        or manifest.members != baseline.members):
+                    raise OriginError(
+                        "same release version cannot describe another manifest")
+            elif manifest.serve_min < baseline.serve_min:
+                raise OriginError("minimum service version would move backwards")
+        self._baseline = manifest
+
+    def _manifest_is_active(self, manifest):
+        active = self._active
+        if active is None or active.version != manifest.version:
+            return False
+        if len(active.members) != len(manifest.members):
+            return False
+        for spec in manifest.members.values():
+            stored = active.members.get(spec.target)
+            if (stored is None or stored.size != spec.size
+                    or stored.sha256 != spec.sha256):
+                return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Workspace, reuse, downloads, and commit
+    # ------------------------------------------------------------------
+
+    def _remove_transient_paths(self):
+        for name in ("stage", "old"):
+            shutil.rmtree(os.path.join(self._root, name), ignore_errors=True)
+
+    @staticmethod
+    def _member_filename(index):
+        return f"member-{index:03d}"
+
+    def _populate_reused(self, manifest, active, stage_dir):
+        reused = set()
+        if active is None:
+            return reused
+
+        for index, spec in enumerate(manifest.members.values()):
+            previous = active.members.get(spec.target)
+            if (previous is None or previous.size != spec.size
+                    or previous.sha256 != spec.sha256):
+                continue
+
+            destination = os.path.join(stage_dir, self._member_filename(index))
+            self._link_or_copy_verified(previous.path, destination)
+            reused.add(spec.target)
+        return reused
+
+    @staticmethod
+    def _link_or_copy_verified(source, destination):
+        try:
+            os.link(source, destination)
+        except OSError:
+            with open(source, "rb") as src, open(destination, "wb") as dst:
+                shutil.copyfileobj(src, dst, length=_IO_CHUNK)
+
+    def _download_missing_members(self, manifest, reused, stage_dir):
+        for index, spec in enumerate(manifest.members.values()):
+            if spec.target in reused:
+                continue
+            destination = os.path.join(stage_dir, self._member_filename(index))
+            self._download_member(spec, destination)
+
+    def _download_member(self, spec, destination):
+        connection = HTTPConnection(
+            self._host, self._port, timeout=self._timeout)
+        try:
+            try:
+                connection.request(
+                    "GET", spec.target, headers={"Connection": "close"})
+                with connection.getresponse() as response:
+                    if response.status != 200:
+                        raise OriginError(
+                            f"member origin returned HTTP {response.status} "
+                            f"for {spec.target}")
+                    length = _accepted_get_length(response, spec.size)
+                    if length != spec.size:
+                        raise OriginError(
+                            f"member Content-Length does not match {spec.target}")
+
+                    digest = hashlib.sha256()
+                    remaining = length
+                    with open(destination, "wb") as output:
+                        while remaining > 0:
+                            chunk = response.read(min(_IO_CHUNK, remaining))
+                            if not chunk:
+                                raise OriginError(
+                                    f"truncated member {spec.target}")
+                            output.write(chunk)
+                            digest.update(chunk)
+                            remaining -= len(chunk)
+
+                    if digest.hexdigest() != spec.sha256:
+                        raise OriginError(
+                            f"SHA-256 mismatch for member {spec.target}")
+            except OriginError:
+                raise
+            except (OSError, HTTPException) as exc:
+                raise OriginError(f"member GET failed for {spec.target}") from exc
+        finally:
+            connection.close()
+
+    def _commit_release(self, manifest, stage_dir):
+        active_dir = os.path.join(self._root, "active")
+        old_dir = os.path.join(self._root, "old")
+        replaced_active_dir = False
+
+        if os.path.lexists(active_dir):
+            shutil.rmtree(old_dir, ignore_errors=True)
+            os.rename(active_dir, old_dir)
+            replaced_active_dir = True
+
+        try:
+            os.rename(stage_dir, active_dir)
+        except OSError:
+            if replaced_active_dir:
+                os.rename(old_dir, active_dir)
+            raise
+
+        members = {}
+        for index, spec in enumerate(manifest.members.values()):
+            path = os.path.join(active_dir, self._member_filename(index))
+            members[spec.target] = _StoredMember(
+                spec.target, spec.size, spec.sha256, path)
+
+        new_active = _ActiveRelease(manifest.version, active_dir, members)
+        # Serial use means no read can be in progress during this assignment.
+        self._active = new_active
+
+        if replaced_active_dir:
+            shutil.rmtree(old_dir)
+        return manifest.version
