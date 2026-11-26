@@ -64,6 +64,58 @@ SHA-256 全部匹配的活动成员直接硬链接/复制复用，不发 GET；�
 恢复安装、target 消失、非法清单、截断成员、留存响应，以及两套完整 64 MiB 发布的
 `tracemalloc`/逻辑磁盘预算和关闭清理。
 
+## 进程内发布源站
+
+`ReleaseOrigin` 是上面的对侧：一个进程内、受配额约束的配置发布源站，直接与
+`ReleaseReader` 的清单/成员协议互通。它在 `127.0.0.1` 的临时端口提供 HTTP，
+状态不跨重启，也不提供上传服务：
+
+```python
+from release_origin import ReleaseCapacityError, ReleaseOrigin
+
+with ReleaseOrigin(max_bytes=12 * 1024, max_versions=8) as origin:
+    origin.publish(10, {"S": b"...3 KiB...", "A": b"...2 KiB..."})
+    origin.publish(11, {"S": b"...3 KiB...", "B": b"...3 KiB..."})
+
+    origin.hold(10)          # 护住已知良好的回退点
+    try:
+        origin.restore(10, 12)   # 以严格递增的新版本号重发原始成员集
+    except ReleaseCapacityError:
+        ...                      # 无合规清理方案，状态完全未变
+
+    origin.retained_versions()   # 升序元组，含当前版本
+    origin.active_version        # 尚未发布时为 None
+    reader = ReleaseReader(
+        "127.0.0.1", origin.port, origin.manifest_target,
+        scratch_dir="/var/cache/gateway-release")
+```
+
+`publish(version, members)` 的版本号是 1 至 2⁶³−1 的严格整数且必须大于当前发布；
+成员是 1–64 个、逻辑名匹配 `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}`、值至多 1 MiB 的
+不可变 `bytes`（允许空）。发布时复制字节，调用方之后改动原字典不影响源站。每个成员
+的 target 为 `/members/<逻辑名>/<内容 SHA-256>`，同名同字节沿用同一 target。清单固定
+在 `/release/manifest.json`，只公布当前发布，`serve_min` 恒为 0，无发布时 404。
+`hold`/`unhold` 幂等、不切换发布也不清理对象；对不存在（含已退役）的版本抛
+`KeyError`，非法版本号抛 `ValueError`。
+
+`restore(source_version, new_version)` 从仍留存的版本取完整原始成员集，以严格递增的
+`new_version` 重新发布；来源版本在该次操作中不会被清理，恢复不继承也不清空保留
+标记。留存准入同时受两项配额约束：所有留存版本引用的不同成员 target 的字节总和
+不超过 `max_bytes`（0–512 MiB），留存版本数不超过 `max_versions`（2–8）。新版本、
+切换前的当前版本（直接回退点）、所有保留标记对应版本以及恢复来源都必须留存；若需
+删除历史版本以同时满足两项配额，删除的版本数最少，多版共享的 target 只计一份字节。
+没有合规方案时抛 `ReleaseCapacityError`，不先清理一部分，也不消耗版本号；成功后
+清单、可读成员与留存集合一起生效。
+
+单次 GET 在选中清单或成员的那一刻取快照，与管理操作重叠时只会看到切换前或切换后
+的完整状态；已选中的成员响应不因其版本随后被清理而截断。target 只要仍被任一留存
+版本引用就能读到原字节，最后一个引用消失后返回 404；未保留的历史成员不承诺长期
+可读，值班流程应先 `hold` 再跨多次操作读取。
+
+`test_release_origin.py` 用真实回环 GET 与 `ReleaseReader` 覆盖题设的 v10–v14 回退
+与恢复、容量拒绝的无副作用与重试、共享成员的最后引用释放、按版数准入、保留标记
+语义、在途响应留存，以及参数校验和关闭行为。
+
 ## 大型二进制页表读取
 
 `PagedReader` 按 4096 字节固定页读取加载器从发布端拿到的单个大型对象（规则索引或
