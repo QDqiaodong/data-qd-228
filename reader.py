@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 __all__ = [
     "ConditionalReader",
+    "MirrorReader",
     "OriginError",
     "PageBudgetExceeded",
     "PagedReader",
@@ -181,6 +182,246 @@ def _strict_bounded_int(value, name, lower, upper):
     if type(value) is not int or not lower <= value <= upper:
         raise ValueError(
             f"{name} must be an integer in [{lower}, {upper}]")
+
+
+# HTTP statuses from the primary that allow this call to fail over.
+_DIVERTABLE_STATUSES = frozenset((502, 503, 504))
+
+
+def _validate_endpoint(endpoint, name):
+    try:
+        host, port = endpoint
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a (host, port) tuple") from exc
+    if not isinstance(host, str) or not host:
+        raise ValueError(f"{name} host must be a non-empty string")
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ValueError(f"{name} port must be an integer in [1, 65535]")
+    return host, port
+
+
+class _MirrorSource:
+    """One configured origin plus its own bounded validator cache."""
+
+    __slots__ = ("host", "port", "entries", "limit")
+
+    def __init__(self, host, port, limit):
+        self.host = host
+        self.port = port
+        self.entries = OrderedDict()
+        self.limit = limit
+
+
+class _FetchOutcome:
+    """One actual GET's result, classified by how the transfer went."""
+
+    __slots__ = ("representation", "error", "divertable")
+
+    def __init__(self, *, representation=None, error=None, divertable=False):
+        self.representation = representation
+        self.error = error
+        self.divertable = divertable
+
+
+class _ProbeCall:
+    """One in-flight probe GET, always joined before its get() call ends."""
+
+    __slots__ = ("_thread", "_outcome", "_exception")
+
+    def __init__(self, reader, source, target):
+        self._outcome = None
+        self._exception = None
+        self._thread = threading.Thread(
+            target=self._run, args=(reader, source, target),
+            name=f"MirrorReader-probe-{id(self)}", daemon=True)
+
+    def _run(self, reader, source, target):
+        try:
+            self._outcome = reader._fetch(source, target)
+        except BaseException as exc:  # re-raised on the calling thread
+            self._exception = exc
+
+    def start(self):
+        self._thread.start()
+
+    def finish(self):
+        self._thread.join()
+        return self._outcome, self._exception
+
+
+class MirrorReader:
+    """Conditional GET reader with bounded primary/standby failover.
+
+    Both origins are caller-configured ``(host, port)`` pairs; the reader
+    never discovers or switches to other hosts.  Each source independently
+    follows the :class:`ConditionalReader` rules (full 200, matching 304,
+    strong ETag, retention headers, bounded LRU) with its own cache, and a
+    GET carries at most the validator that same source retained for the
+    exact target.  Construction performs no network I/O and instances are
+    used serially.
+    """
+
+    def __init__(self, primary, standby, *, entries=16, max_body=65536,
+                 timeout=2, failures=2, cooldown=10, clock=time.monotonic):
+        primary_endpoint = _validate_endpoint(primary, "primary")
+        standby_endpoint = _validate_endpoint(standby, "standby")
+        if primary_endpoint == standby_endpoint:
+            raise ValueError(
+                "primary and standby must be different (host, port) tuples")
+        if type(entries) is not int or entries < 1:
+            raise ValueError("entries must be a positive integer")
+        if type(max_body) is not int or max_body < 1:
+            raise ValueError("max_body must be a positive integer")
+        if isinstance(timeout, bool) \
+                or not isinstance(timeout, (int, float)) \
+                or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be a positive finite number")
+        _strict_bounded_int(failures, "failures", 1, 8)
+        if isinstance(cooldown, bool) \
+                or not isinstance(cooldown, (int, float)) \
+                or not math.isfinite(cooldown) or cooldown <= 0:
+            raise ValueError(
+                "cooldown must be a positive finite number of seconds")
+
+        self._primary = _MirrorSource(*primary_endpoint, entries)
+        self._standby = _MirrorSource(*standby_endpoint, entries)
+        self._max_body = max_body
+        self._timeout = timeout
+        self._failure_limit = failures
+        self._cooldown = cooldown
+        self._clock = clock
+        self._streak = 0
+        self._cooldown_end = None
+
+    def get(self, target):
+        """Read target from the primary, failing over only as contracted."""
+        _validate_target(target)
+        if self._cooldown_end is not None:
+            if self._clock() < self._cooldown_end:
+                # Standby-only period; a standby failure never wakes the
+                # primary ahead of schedule.
+                return self._deliver(self._fetch(self._standby, target))
+            return self._probe(target)
+
+        outcome = self._fetch(self._primary, target)
+        if outcome.error is None or not outcome.divertable:
+            # Any non-divertable primary result ends the failure streak.
+            self._streak = 0
+            return self._deliver(outcome)
+        self._register_failure()
+        return self._deliver(self._fetch(self._standby, target))
+
+    def _register_failure(self):
+        self._streak += 1
+        if self._streak >= self._failure_limit:
+            self._start_cooldown()
+
+    def _start_cooldown(self):
+        # The standby-only period is anchored at the moment this last
+        # primary failure is registered.
+        self._cooldown_end = self._clock() + self._cooldown
+
+    def _probe(self, target):
+        # Only this call may start the standby GET while the primary result
+        # is still undecided; both requests are joined before the call ends,
+        # and the primary keeps the deciding vote either way.
+        primary_call = _ProbeCall(self, self._primary, target)
+        standby_call = _ProbeCall(self, self._standby, target)
+        primary_call.start()
+        standby_call.start()
+        primary_outcome, primary_exception = primary_call.finish()
+        standby_outcome, standby_exception = standby_call.finish()
+
+        if primary_exception is not None:
+            raise primary_exception
+        if primary_outcome.error is None:
+            self._cooldown_end = None
+            self._streak = 0
+            return primary_outcome.representation
+        if not primary_outcome.divertable:
+            # An authoritative primary error decides the call; standby bytes
+            # are never delivered instead.
+            self._cooldown_end = None
+            self._streak = 0
+            raise primary_outcome.error
+
+        # Divertable probe failure: a new full cooldown starts at once and
+        # this call still delivers a qualified standby result.
+        self._streak += 1
+        self._start_cooldown()
+        if standby_exception is not None:
+            raise standby_exception
+        return self._deliver(standby_outcome)
+
+    @staticmethod
+    def _deliver(outcome):
+        if outcome.error is not None:
+            raise outcome.error
+        return outcome.representation
+
+    def _fetch(self, source, target):
+        """Perform one conditional GET against one configured source.
+
+        Origin-contract failures come back as classified outcomes instead of
+        being raised, so the caller can tell divertable primary failures
+        from authoritative ones by how the transfer actually went.  Cache
+        mutations follow the same rules as ConditionalReader.
+        """
+        entries = source.entries
+        previous = entries.get(target)
+        headers = ({"If-None-Match": previous.tag}
+                   if previous is not None else {})
+        connection = HTTPConnection(
+            source.host, source.port, timeout=self._timeout)
+        try:
+            connection.request("GET", target, headers=headers)
+            with connection.getresponse() as response:
+                tag = response.getheader("ETag")
+                retain = all(response.getheader(h) is None for h in (
+                    "Vary", "Set-Cookie", "Cache-Control"))
+                if response.status == 304:
+                    if previous is None or tag != previous.tag:
+                        entries.pop(target, None)
+                        return _FetchOutcome(error=OriginError(
+                            "304 did not confirm the requested validator"))
+                    if retain:
+                        entries.move_to_end(target)
+                    else:
+                        entries.pop(target, None)
+                    return _FetchOutcome(
+                        representation=Representation(previous.body, True))
+                if response.status != 200:
+                    if response.status in (404, 410):
+                        entries.pop(target, None)
+                    return _FetchOutcome(
+                        error=OriginError(
+                            f"origin returned HTTP {response.status}"),
+                        divertable=response.status in _DIVERTABLE_STATUSES)
+                length = response.getheader("Content-Length", "")
+                if (response.getheader("Transfer-Encoding") is not None
+                        or not _LENGTH_RE.fullmatch(length)
+                        or int(length) > self._max_body):
+                    return _FetchOutcome(error=OriginError(
+                        "200 has no supported bounded Content-Length"))
+                body = response.read(int(length))
+                if len(body) != int(length):
+                    # Truncation after a legal length header is divertable.
+                    return _FetchOutcome(
+                        error=OriginError(
+                            "origin body ended before Content-Length"),
+                        divertable=True)
+        except (OSError, HTTPException) as exc:
+            error = OriginError("HTTP transport failed")
+            error.__cause__ = exc
+            return _FetchOutcome(error=error, divertable=True)
+        finally:
+            connection.close()
+        entries.pop(target, None)
+        if retain and tag and _STRONG_TAG_RE.fullmatch(tag):
+            entries[target] = _Entry(tag, body)
+            if len(entries) > source.limit:
+                entries.popitem(last=False)
+        return _FetchOutcome(representation=Representation(body, False))
 
 
 class Ticket:
