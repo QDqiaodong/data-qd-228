@@ -64,6 +64,72 @@ SHA-256 全部匹配的活动成员直接硬链接/复制复用，不发 GET；�
 恢复安装、target 消失、非法清单、截断成员、留存响应，以及两套完整 64 MiB 发布的
 `tracemalloc`/逻辑磁盘预算和关闭清理。
 
+## 大型二进制页表读取
+
+`PagedReader` 按 4096 字节固定页读取加载器从发布端拿到的单个大型对象（规则索引或
+规则页）。实例在构造时绑定调用方给出的精确 target、总字节数和带引号强 ETag，之后
+不发现、不切换源站版本，构造本身不联网：
+
+```python
+from reader import OriginError, PageBudgetExceeded, PagedReader
+
+reader = PagedReader(
+    "127.0.0.1", port, "/rules/index.bin?table=main",
+    size=4096 * 4096,          # 4096 的正整数倍，最大 256 MiB
+    etag='"v1-strong-tag"',    # 沿用库内带引号强标签规则
+    retained_pages=64,         # 本地留页名额，0..64
+    timeout=2,
+)
+try:
+    pages = reader.read_pages(
+        [43, 40, 43],           # 至多 32 个页号，按输入顺序返回、保留重复
+        max_gets=1,             # 本批可用 GET 数，0..32
+        max_body_bytes=16384,   # 本批响应体字节预算，0..1 MiB
+        keep=False,
+    )
+except PageBudgetExceeded:
+    ...                        # 预算内无可行方案或留页容量不足，发包前拒绝
+except OriginError:
+    ...                        # 源站协议、标签或传输失败，整批不交付不留存
+```
+
+target 沿用库内精确 ASCII origin-form path/query 校验且不超过 256 字节；size 必须是
+4096 的正整数倍且不超过 256 MiB；所有整数参数拒绝布尔值，`keep` 必须是 bool；
+格式或范围错误抛 `ValueError`，且不回源、不改变已保留页。
+
+### 留页与回源预算是两个独立约束
+
+留页是该实例绑定对象的本地字节，后续读取不再向源站确认，源站换版或不可用时仍可
+读出；这些字节属于调用方指定的旧对象，不会被用来冒充另一版本。只有 `keep=True`
+且整批成功时，本次明确请求的页才进入保留集合：重复页只占一个名额，为跨空洞顺带
+收到的页不留存，且不淘汰旧页；容量不足以容纳全部新增页时整批失败。普通读可以
+使用已有留页但不新增。
+
+每批先按已保留页确定缺页，并在发出任何 GET 前判断可行性；全部命中时不发 GET。
+单个 GET 取一个连续页段，段长不超过 8 页，可以跨过未请求的空洞或已保留页以节省
+请求数；整段字节（含空洞和重复下载的字节）都计入 `max_body_bytes`。只有两个预算
+都能覆盖全部缺页时才开始发包；库内规划最小化 GET 数，再最小化回源字节，但不保证
+在所有可行方案中总选最优。预算内无可行方案或留页容量不足时抛 `PageBudgetExceeded`，
+保留集合不变。
+
+### 回源协议与失败语义
+
+每个段对原 target 发一个带 `Range: bytes=起点-终点`（终点包含）和 `If-Match: <etag>`
+的 GET，固定源站、不跟随重定向、不重试。只接受单段 `206`：状态、ETag、恰好出现
+一次的 `Content-Range: bytes 起点-终点/总长` 和与段长精确相等的单一
+`Content-Length` 全部先校验，再读响应体；拒绝 `Transfer-Encoding`、非 identity 的
+`Content-Encoding` 和截断响应。忽略 Range 的 200、412、边界/总长/标签不符及传输
+失败都抛 `OriginError`，不读诊断体，也不回退成整对象 GET。
+
+一段失败即整批失败：已经收到的页既不交付也不留存；此前成功保留的页仍可正常读取。
+`close()` 清空实例持有的页且可重复调用，关闭后的读取抛 `RuntimeError`。实例按串行
+使用设计，不含线程、定时器或磁盘 I/O。
+
+`test_paged_reader.py` 使用自制回环源站按页生成可区分字节，记录实际 target、
+Range 与 If-Match，覆盖预算收紧/放宽下的合并段与单页段、全命中零回源、留页满
+拒绝、顺带页不留存、源站换版后旧留页可读、412/错误 Content-Range/截断/忽略 Range/
+重复头/Transfer-Encoding 失败不留存，以及全部参数校验和关闭行为。
+
 ## 并发调度
 
 `ScheduledReader` 在进程内合并相同精确 target 的并发读取：

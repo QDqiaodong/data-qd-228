@@ -18,6 +18,8 @@ from urllib.parse import urlsplit
 __all__ = [
     "ConditionalReader",
     "OriginError",
+    "PageBudgetExceeded",
+    "PagedReader",
     "QueueFull",
     "ReleaseReader",
     "ReleaseUnavailable",
@@ -37,11 +39,22 @@ _MAX_MEMBERS = 64
 _VERSION_MAX = (1 << 63) - 1
 _IO_CHUNK = 64 * _KIB
 
+# Fixed geometry and bounds for the large binary page-table reader.
+_PAGE_SIZE = 4096
+_PAGED_OBJECT_MAX = 256 * _MIB
+_PAGED_BATCH_MAX = 32
+_PAGED_SEGMENT_MAX = 8
+_PAGED_RETAINED_MAX = 64
+
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 
 
 class OriginError(RuntimeError):
     pass
+
+
+class PageBudgetExceeded(RuntimeError):
+    """No origin plan fits the GET/body budgets or the retained-page capacity."""
 
 
 class ReleaseUnavailable(OriginError):
@@ -1051,3 +1064,280 @@ class ReleaseReader:
         if replaced_active_dir:
             shutil.rmtree(old_dir)
         return manifest.version
+
+
+# -----------------------------------------------------------------------
+# Large binary page-table object reader
+# -----------------------------------------------------------------------
+
+_CONTENT_RANGE_RE = re.compile(r"bytes ([0-9]+)-([0-9]+)/([0-9]+)\Z")
+
+
+class PagedReader:
+    """Bounded ranged reader for one fixed, strongly validated binary object.
+
+    An instance is permanently bound to the exact target, total size and
+    strong ETag handed in by the caller; it never discovers or switches to
+    another object version.  Pages are 4096 bytes each.  A small set of
+    pages may be retained locally and served without any origin contact,
+    even after the origin has replaced the object.
+    """
+
+    def __init__(self, host, port, target, *, size, etag,
+                 retained_pages=64, timeout=2):
+        _validate_release_target(target)
+        if (type(size) is not int or size <= 0
+                or size > _PAGED_OBJECT_MAX or size % _PAGE_SIZE != 0):
+            raise ValueError(
+                "size must be a positive multiple of 4096 no larger than "
+                "256 MiB")
+        if type(etag) is not str or _STRONG_TAG_RE.fullmatch(etag) is None:
+            raise ValueError("etag must be a quoted strong validator")
+        if type(retained_pages) is not int or not (
+                0 <= retained_pages <= _PAGED_RETAINED_MAX):
+            raise ValueError("retained_pages must be an integer in [0, 64]")
+        if isinstance(timeout, bool) or not isinstance(
+                timeout, (int, float)) or not math.isfinite(timeout) \
+                or timeout <= 0:
+            raise ValueError("timeout must be a positive finite number")
+
+        self._host = host
+        self._port = port
+        self._target = target
+        self._size = size
+        self._etag = etag
+        self._retain_limit = retained_pages
+        self._timeout = timeout
+        self._page_count = size // _PAGE_SIZE
+        self._retained = {}
+        self._closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+        return False
+
+    @property
+    def page_count(self):
+        return self._page_count
+
+    def close(self):
+        """Release every page held by this instance; safe to repeat."""
+        self._closed = True
+        self._retained.clear()
+
+    def read_pages(self, pages, *, max_gets, max_body_bytes, keep=False):
+        if self._closed:
+            raise RuntimeError("PagedReader is closed")
+        if not isinstance(pages, (list, tuple)):
+            raise ValueError("pages must be a list or tuple of page numbers")
+        if len(pages) > _PAGED_BATCH_MAX:
+            raise ValueError("at most 32 pages may be requested per batch")
+        if not all(type(page) is int for page in pages):
+            raise ValueError("page numbers must be integers (not bool)")
+        if not all(0 <= page < self._page_count for page in pages):
+            raise ValueError("page numbers must be within the bound object")
+        if type(max_gets) is not int or not 0 <= max_gets <= _PAGED_BATCH_MAX:
+            raise ValueError("max_gets must be an integer in [0, 32]")
+        if type(max_body_bytes) is not int or not (
+                0 <= max_body_bytes <= _MIB):
+            raise ValueError("max_body_bytes must be an integer in [0, 1 MiB]")
+        if type(keep) is not bool:
+            raise ValueError("keep must be a bool")
+
+        if not pages:
+            return []
+
+        wanted = set(pages)
+        missing = wanted.difference(self._retained)
+
+        if keep:
+            # Retention never evicts, so a full set rejects before any GET.
+            if len(self._retained) + sum(
+                    1 for page in wanted if page not in self._retained) \
+                    > self._retain_limit:
+                raise PageBudgetExceeded(
+                    "not enough retained-page capacity for this batch")
+
+        segments = []
+        if missing:
+            segments = self._plan_segments(missing, max_gets, max_body_bytes)
+            if segments is None:
+                raise PageBudgetExceeded(
+                    "no origin request plan fits the GET and body budgets")
+
+            # All feasibility checks happen before any packet is sent.
+            fetched = {}
+            try:
+                for start, end in segments:
+                    for page, data in self._fetch_segment(start, end):
+                        fetched[page] = data
+            except BaseException:
+                # Nothing from a failed batch may be delivered or retained.
+                fetched.clear()
+                raise
+        else:
+            fetched = {}
+
+        if keep:
+            for page in wanted:
+                if page not in self._retained:
+                    self._retained[page] = fetched[page]
+
+        def page_bytes(page):
+            data = self._retained.get(page)
+            return data if data is not None else fetched[page]
+
+        return [page_bytes(page) for page in pages]
+
+    # ------------------------------------------------------------------
+    # Segment planning and ranged origin access
+    # ------------------------------------------------------------------
+
+    def _plan_segments(self, missing, max_gets, max_body_bytes):
+        """Find consecutive segments covering every missing page.
+
+        A segment spans at most eight pages and may cross unrequested holes
+        or already retained pages; every byte of every segment counts
+        against the body budget, including holes and duplicate downloads.
+        Any feasible plan is acceptable, so the search minimizes segment
+        count first and total fetched pages second.
+        """
+        ordered = sorted(missing)
+        count = len(ordered)
+        last_index = count - 1
+        max_pages = max_body_bytes // _PAGE_SIZE
+
+        # costs[g][i] is the minimum fetched-page count of a cover of
+        # ordered[i:] using exactly g segments; costs[g][count] is the
+        # empty zero-page tail.  next_end[g][i] stores the exclusive end
+        # page chosen for the first segment, for reconstruction.
+        costs = [{count: 0}]
+        next_end = [{}]
+        for get_count in range(1, max_gets + 1):
+            level_costs = {count: 0}
+            level_ends = {}
+            for i in range(last_index, -1, -1):
+                start = ordered[i]
+                upper = min(self._page_count, start + _PAGED_SEGMENT_MAX)
+                best_cost = None
+                best_end = None
+                for end in range(start + 1, upper + 1):
+                    # Smallest missing index not inside [start, end).
+                    j = i + 1
+                    while j < count and ordered[j] < end:
+                        j += 1
+                    tail_cost = costs[get_count - 1].get(j)
+                    if tail_cost is None:
+                        continue
+                    total_cost = (end - start) + tail_cost
+                    if total_cost > max_pages:
+                        continue
+                    if best_cost is None or total_cost < best_cost:
+                        best_cost = total_cost
+                        best_end = end
+                if best_cost is not None:
+                    level_costs[i] = best_cost
+                    level_ends[i] = best_end
+            costs.append(level_costs)
+            next_end.append(level_ends)
+
+        best_gets = None
+        best_cost = None
+        for get_count in range(1, max_gets + 1):
+            cost = costs[get_count].get(0)
+            if cost is not None and (best_cost is None or cost < best_cost):
+                best_gets = get_count
+                best_cost = cost
+        if best_gets is None:
+            return None
+
+        segments = []
+        i = 0
+        get_count = best_gets
+        while i < count:
+            start = ordered[i]
+            end = next_end[get_count][i]
+            segments.append((start, end - 1))
+            while i < count and ordered[i] < end:
+                i += 1
+            get_count -= 1
+        return segments
+
+    def _fetch_segment(self, start_page, end_page):
+        first = start_page * _PAGE_SIZE
+        last = (end_page + 1) * _PAGE_SIZE - 1
+        range_value = f"bytes={first}-{last}"
+        expected_length = (end_page - start_page + 1) * _PAGE_SIZE
+        headers = {
+            "Range": range_value,
+            "If-Match": self._etag,
+            "Connection": "close",
+        }
+
+        connection = HTTPConnection(
+            self._host, self._port, timeout=self._timeout)
+        try:
+            try:
+                connection.request("GET", self._target, headers=headers)
+                with connection.getresponse() as response:
+                    self._check_segment_headers(
+                        response, first, last, expected_length)
+                    body = response.read(expected_length)
+                    if len(body) != expected_length:
+                        raise OriginError(
+                            "range response ended before Content-Length")
+            except OriginError:
+                raise
+            except (OSError, HTTPException) as exc:
+                raise OriginError("HTTP transport failed") from exc
+        finally:
+            connection.close()
+
+        return [
+            (page, body[offset:offset + _PAGE_SIZE])
+            for offset, page in zip(
+                range(0, expected_length, _PAGE_SIZE),
+                range(start_page, end_page + 1))
+        ]
+
+    def _check_segment_headers(self, response, first, last, expected_length):
+        # Status and every header are validated before any body bytes are read.
+        if response.status != 206:
+            raise OriginError(
+                f"origin returned HTTP {response.status} instead of 206")
+
+        def single(name):
+            values = response.headers.get_all(name)
+            if len(values or ()) != 1:
+                raise OriginError(
+                    f"206 must carry exactly one {name} header")
+            return values[0]
+
+        if response.headers.get_all("Transfer-Encoding"):
+            raise OriginError("responses with Transfer-Encoding are not accepted")
+        encodings = response.headers.get_all("Content-Encoding") or ()
+        for encoding in encodings:
+            codings = [part.strip().lower() for part in encoding.split(",")]
+            if any(coding != "identity" for coding in codings):
+                raise OriginError("only identity Content-Encoding is accepted")
+
+        etag = single("ETag")
+        if etag != self._etag:
+            raise OriginError("206 ETag does not match the bound strong tag")
+
+        content_range = single("Content-Range")
+        match = _CONTENT_RANGE_RE.fullmatch(content_range)
+        if match is None or (int(match.group(1)), int(match.group(2)),
+                             int(match.group(3))) != (first, last, self._size):
+            raise OriginError(
+                "206 Content-Range does not match the requested segment")
+
+        length_value = single("Content-Length")
+        if _LENGTH_RE.fullmatch(length_value) is None:
+            raise OriginError("206 must carry a bounded Content-Length")
+        if int(length_value) != expected_length:
+            raise OriginError(
+                "206 Content-Length does not match the requested segment")
